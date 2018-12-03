@@ -99,22 +99,11 @@ public class LDAPDirectory extends AbstractDirectory {
 
     @Override
     public List<Reference> getReferences(String referenceFieldName) {
-        initLDAPConfigIfNeeded();
         return references.get(referenceFieldName);
     }
 
-    protected void initLDAPConfigIfNeeded() {
-        // double checked locking with volatile pattern to ensure concurrent lazy init
-        if (searchControls == null) {
-            synchronized (this) {
-                if (searchControls == null) {
-                    initLDAPConfig();
-                }
-            }
-        }
-    }
-
-    protected void initLDAPConfig() {
+    @Override
+    public boolean initializeConnection() {
         LDAPDirectoryDescriptor ldapDirectoryDesc = getDescriptor();
         initSchemaFieldMap();
 
@@ -135,6 +124,7 @@ public class LDAPDirectory extends AbstractDirectory {
         log.debug(String.format("initialized LDAP directory %s with fields [%s] and references [%s]", getName(),
                 StringUtils.join(getSchemaFieldMap().keySet().toArray(), ", "),
                 StringUtils.join(references.keySet().toArray(), ", ")));
+        return false; // no data load
     }
 
     /**
@@ -336,7 +326,6 @@ public class LDAPDirectory extends AbstractDirectory {
 
     @Override
     public Session getSession() {
-        initLDAPConfigIfNeeded();
         Session session = new LDAPSession(this);
         addSession(session);
         return session;

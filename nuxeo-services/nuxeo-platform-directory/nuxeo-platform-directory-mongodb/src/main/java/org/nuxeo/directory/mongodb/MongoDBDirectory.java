@@ -29,15 +29,17 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.nuxeo.ecm.core.schema.SchemaManager;
-import org.nuxeo.ecm.core.schema.types.Schema;
+import org.bson.Document;
 import org.nuxeo.ecm.directory.AbstractDirectory;
 import org.nuxeo.ecm.directory.Directory;
-import org.nuxeo.ecm.directory.DirectoryCSVLoader;
+import org.nuxeo.ecm.directory.Reference;
 import org.nuxeo.ecm.directory.Session;
 import org.nuxeo.runtime.api.Framework;
+import org.nuxeo.runtime.mongodb.MongoDBConnectionHelper;
+import org.nuxeo.runtime.mongodb.MongoDBConnectionService;
 
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Indexes;
 
 /**
@@ -47,10 +49,20 @@ import com.mongodb.client.model.Indexes;
  */
 public class MongoDBDirectory extends AbstractDirectory {
 
-    protected String countersCollectionName;
+    /**
+     * Prefix used to retrieve a MongoDB connection from {@link MongoDBConnectionService}.
+     * <p>
+     * The connection id will be {@code directory/[DIRECTORY_NAME]}.
+     *
+     * @since 10.3
+     */
+    public static final String DIRECTORY_CONNECTION_PREFIX = "directory/";
 
-    // used in double-checked locking for lazy init
-    protected volatile boolean initialized;
+    protected MongoDatabase database;
+
+    protected MongoCollection<Document> collection;
+
+    protected MongoCollection<Document> countersCollection;
 
     public MongoDBDirectory(MongoDBDirectoryDescriptor descriptor) {
         super(descriptor, MongoDBReference.class);
@@ -60,8 +72,6 @@ public class MongoDBDirectory extends AbstractDirectory {
 
         // cache fallback
         fallbackOnDefaultCache();
-
-        countersCollectionName = getName() + ".counters";
     }
 
     @Override
@@ -73,7 +83,6 @@ public class MongoDBDirectory extends AbstractDirectory {
     public Session getSession() {
         MongoDBSession session = new MongoDBSession(this);
         addSession(session);
-        initializeIfNeeded(session);
         return session;
     }
 
@@ -82,30 +91,33 @@ public class MongoDBDirectory extends AbstractDirectory {
         return schemaFieldMap.containsKey(TENANT_ID_FIELD);
     }
 
-    protected void initializeIfNeeded(MongoDBSession session) {
-        if (!initialized) {
-            synchronized (this) {
-                if (!initialized) {
-                    initialize(session);
-                    initialized = true;
-                }
-            }
-        }
+    @Override
+    public void initialize() {
+        // initialize collection and load data
+        super.initialize();
+        // initialize MongoDB references
+        initializeReferences();
     }
 
-    protected void initialize(MongoDBSession session) {
+    @Override
+    public boolean initializeConnection() {
         initSchemaFieldMap();
 
+        MongoDBConnectionService mongoService = Framework.getService(MongoDBConnectionService.class);
+        database = mongoService.getDatabase(DIRECTORY_CONNECTION_PREFIX + getName());
+        collection = database.getCollection(getName());
+        String countersCollectionName = getName() + ".counters";
+        countersCollection = database.getCollection(countersCollectionName);
+
         // Initialize counters collection if autoincrement enabled
-        if (descriptor.isAutoincrementIdField() && !session.hasCollection(countersCollectionName)) {
+        if (descriptor.isAutoincrementIdField() && !hasCollection(countersCollectionName)) {
             Map<String, Object> seq = new HashMap<>();
             seq.put(MONGODB_ID, getName());
             seq.put(MONGODB_SEQ, 0L);
-            session.getCollection(countersCollectionName).insertOne(MongoDBSerializationHelper.fieldMapToBson(seq));
+            getCountersCollection().insertOne(MongoDBSerializationHelper.fieldMapToBson(seq));
         }
 
         String policy = descriptor.getCreateTablePolicy();
-        MongoCollection collection = session.getCollection(getName());
         boolean dropCollection = false;
         boolean loadData = false;
 
@@ -116,9 +128,10 @@ public class MongoDBDirectory extends AbstractDirectory {
             break;
         case CREATE_TABLE_POLICY_ON_MISSING_COLUMNS:
             // As MongoDB does not have the notion of columns, only load data if collection doesn't exist
-            if (!session.hasCollection(getName())) {
+            if (!hasCollection(getName())) {
                 loadData = true;
             }
+            break;
         default:
             break;
         }
@@ -128,17 +141,16 @@ public class MongoDBDirectory extends AbstractDirectory {
         if (isMultiTenant()) {
             collection.createIndex(Indexes.hashed(TENANT_ID_FIELD));
         }
-        if (loadData) {
-            SchemaManager schemaManager = Framework.getService(SchemaManager.class);
-            Schema schema = schemaManager.getSchema(getSchema());
-            loadData(schema, session);
-        }
+        return loadData;
     }
 
-    protected void loadData(Schema schema, Session session) {
-        if (descriptor.getDataFileName() != null) {
-            Framework.doPrivileged(() -> DirectoryCSVLoader.loadData(descriptor.getDataFileName(),
-                    descriptor.getDataFileCharacterSeparator(), schema, session::createEntry));
+    protected void initializeReferences() {
+        try (MongoDBSession session = (MongoDBSession) getSession()) {
+            for (Reference reference : getReferences()) {
+                if (reference instanceof MongoDBReference) {
+                    ((MongoDBReference) reference).initialize(session);
+                }
+            }
         }
     }
 
@@ -148,8 +160,32 @@ public class MongoDBDirectory extends AbstractDirectory {
         }
     }
 
-    public String getCountersCollectionName() {
-        return countersCollectionName;
+    /**
+     * Checks if the MongoDB server has the collection.
+     *
+     * @param collection the collection name
+     * @return true if the server has the collection, false otherwise
+     */
+    protected boolean hasCollection(String collection) {
+        return MongoDBConnectionHelper.hasCollection(database, collection);
+    }
+
+    /**
+     * Retrieves the collection associated to this directory.
+     *
+     * @return the MongoDB collection
+     */
+    protected MongoCollection<Document> getCollection() {
+        return collection;
+    }
+
+    /**
+     * Retrieves the counters collection associated to this directory.
+     *
+     * @return the MongoDB counters collection
+     */
+    protected MongoCollection<Document> getCountersCollection() {
+        return countersCollection;
     }
 
     @Override
