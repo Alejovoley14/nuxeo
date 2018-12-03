@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<xs:schema targetNamespace="http://www.nuxeo.org/ecm/schemas/documentsLists_noid"
+  xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <!-- id is forbidden for VCS, use the doc name instead for storage -->
+  <xs:element name="userid" type="xs:string" />
+  <xs:element name="listid" type="xs:string" />
+  <xs:element name="repo" type="xs:string" />
+  <xs:element name="ref" type="xs:string" />
+  <xs:element name="reftype" type="xs:integer" />
+</xs:schema>
