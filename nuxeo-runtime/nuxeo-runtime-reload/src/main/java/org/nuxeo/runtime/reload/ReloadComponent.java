@@ -21,19 +21,26 @@ package org.nuxeo.runtime.reload;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.jar.Manifest;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.zip.ZipFile;
 
 import javax.transaction.Transaction;
 
@@ -317,6 +324,7 @@ public class ReloadComponent extends DefaultComponent implements ReloadService {
                 logComponentManagerStatus();
 
                 result.merge(_undeployBundles(bundlesNamesToUndeploy));
+                clearSunJarFileFactoryCache(result);
                 componentManager.unstash();
 
                 // Clear the class loader
@@ -491,6 +499,85 @@ public class ReloadComponent extends DefaultComponent implements ReloadService {
             ctx.ungetService(ref);
         }
         return result;
+    }
+
+    /**
+     * Gets the un-deployed bundle from given {@link ReloadResult result} and try to remove them from
+     * {@link sun.net.www.protocol.jar.JarFileFactory} otherwise we'll have resource conflict when opening
+     * {@link InputStream stream} from {@link URL url}.
+     */
+    @SuppressWarnings("unchecked")
+    protected void clearSunJarFileFactoryCache(ReloadResult result) {
+        try {
+            List<String> jarLocations = result.undeployedBundlesAsStream().map(Bundle::getLocation).collect(
+                    Collectors.toList());
+            log.debug("Clear Sun JarFileFactory caches for jars={}", jarLocations);
+            Class jarFileFactory = Class.forName("sun.net.www.protocol.jar.JarFileFactory");
+
+            // don't generify these maps as their contents are NOT stable across runtimes
+            // work with copy as factory can be accessed during our removals
+            Field fileCacheField = jarFileFactory.getDeclaredField("fileCache");
+            fileCacheField.setAccessible(true);
+            Map fileCache = (Map) fileCacheField.get(null);
+            Map fileCacheCopy = new HashMap(fileCache);
+
+            Field urlCacheField = jarFileFactory.getDeclaredField("urlCache");
+            urlCacheField.setAccessible(true);
+            Map urlCache = (Map) urlCacheField.get(null);
+            Map urlCacheCopy = new HashMap(urlCache);
+
+            // collect keys of cache
+            List urlCacheRemoveKeys = new ArrayList();
+            for (Entry entry : (Set<Entry>) urlCacheCopy.entrySet()) {
+                Object key = entry.getKey();
+                if (key instanceof ZipFile) {
+                    ZipFile zipFile = (ZipFile) key;
+                    if (jarLocations.stream().anyMatch(jar -> jar.startsWith(zipFile.getName()))) {
+                        urlCacheRemoveKeys.add(key);
+                    }
+                }
+            }
+
+            List fileCacheRemoveKeys = new ArrayList();
+            for (Entry entry : (Set<Entry>) fileCacheCopy.entrySet()) {
+                if (urlCacheRemoveKeys.contains(entry.getValue())) {
+                    fileCacheRemoveKeys.add(entry.getKey());
+                }
+            }
+
+            // now remove from factory
+            for (Object fileCacheRemoveKey : fileCacheRemoveKeys) {
+                try {
+                    Object remove = fileCache.remove(fileCacheRemoveKey);
+                    if (remove != null) {
+                        log.trace("Removed item from fileCache={}", remove);
+                    }
+                } catch (Throwable e) {
+                    log.warn("Failed to remove item from fileCache={}", fileCacheRemoveKey);
+                }
+            }
+
+            for (Object urlCacheRemoveKey : urlCacheRemoveKeys) {
+                try {
+                    Object remove = urlCache.remove(urlCacheRemoveKey);
+                    try {
+                        ((ZipFile) urlCacheRemoveKey).close();
+                    } catch (Throwable e) {
+                        // Ignore
+                    }
+                    if (remove != null) {
+                        log.trace("Removed item from urlCache={}" + remove);
+                    }
+                } catch (final Throwable e) {
+                    log.warn("Failed to remove item from urlCache={}", urlCacheRemoveKey);
+                }
+
+            }
+        } catch (ClassNotFoundException | NoSuchFieldException e) {
+            // ignore - probably not a sun VM
+        } catch (Throwable e) {
+            log.error("Unable to clear Sun JarFileFactory, you might need to restart Nuxeo", e);
+        }
     }
 
     /**
